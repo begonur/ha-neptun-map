@@ -2,7 +2,7 @@
 
 Custom Home Assistant dashboard card for displaying the NEPTUN air-threat map of Ukraine.
 
-> **Alpha software:** current version is `0.0.1-alpha.1`.
+> **Alpha software:** current version is `0.0.1-beta.1`.
 
 ## Features
 
