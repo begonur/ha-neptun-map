@@ -13,6 +13,7 @@ class HANeptunMap extends HTMLElement {
 
     this._markers = new Map();
     this._clusterMarkers = [];
+    this._clusterPool = new Map();
     this._clusterRevision = 0;
     this._oblastLabels = [];
     this._cityLabels = [];
@@ -21,6 +22,18 @@ class HANeptunMap extends HTMLElement {
     this._raionBoundaryLayer = null;
     this._raionBoundaryGeoJSON = null;
     this._oblastBorderLayer = null;
+
+    /*
+     * Phase 3 performance caches.
+     *
+     * District -> oblast ownership never changes after GeoJSON load,
+     * so do the expensive point-in-polygon lookup once. SVG clip
+     * nodes are also kept and only their path geometry is refreshed
+     * after Leaflet finishes a zoom.
+     */
+    this._raionClipAssignments = null;
+    this._raionClipDefs = null;
+    this._raionClipPaths = new Map();
     this._raionCenterLabels = [];
     this._raionsLoaded = false;
 
@@ -41,6 +54,40 @@ class HANeptunMap extends HTMLElement {
     this._ukraineRealBounds = null;
 
     this._lastIconZoomBucket = null;
+
+    /*
+     * Performance state.
+     *
+     * Leaflet already moves the whole map pane with a compositor
+     * transform during drag/pinch. Any marker/cluster DOM rebuild
+     * while that gesture is active forces extra main-thread work
+     * and is especially expensive in iOS WKWebView.
+     */
+    this._mapInteracting = false;
+    this._clusterPending = false;
+    this._clusterRaf = null;
+
+    /*
+     * Prediction / clustering scheduler.
+     *
+     * Moving targets only need work while the card is visible.
+     * Clustering is requested only when a predicted position has
+     * actually moved far enough to affect the rendered map.
+     */
+    this._animationLastPrediction = 0;
+    this._animationLastCluster = 0;
+    this._predictionInterval = 100;
+    this._clusterInterval = 350;
+    this._clusterMoveEpsilon = 0.000015;
+    this._animationVisibilityHandler = null;
+
+    /*
+     * Snapshot-derived lookup tables. Rebuilt once per realtime
+     * snapshot so polygon styling is O(districts + alerts), not
+     * O(districts × alerts) on every style/update pass.
+     */
+    this._raionAlertLevels = new Map();
+    this._oblastAlertLevels = new Map();
   }
 
 
@@ -1375,12 +1422,28 @@ class HANeptunMap extends HTMLElement {
     );
 
 
-    this._map.on(
-      "zoomend",
+    /*
+     * During drag/pinch/zoom the map must be compositor-only.
+     * We deliberately suspend prediction/clustering and all
+     * expensive label/GeoJSON work until Leaflet finishes the
+     * interaction. This is critical for iOS WKWebView and also
+     * prevents this card from stealing frames from Lovelace.
+     */
+
+    const beginInteraction =
       () => {
 
+        this._mapInteracting = true;
+      };
+
+
+    const finishInteraction =
+      forceIcons => {
+
+        this._mapInteracting = false;
+
         this.updateThreatAppearance(
-          true
+          forceIcons
         );
 
         this.updateMapLabels();
@@ -1388,9 +1451,31 @@ class HANeptunMap extends HTMLElement {
         this.updateKyivBoundary();
 
         requestAnimationFrame(
-          () =>
-            this.applyRaionOblastClip()
+          () => {
+
+            if (
+              !this._map ||
+              this._mapInteracting
+            )
+              return;
+
+            this.applyRaionOblastClip();
+          }
         );
+      };
+
+
+    this._map.on(
+      "movestart zoomstart dragstart",
+      beginInteraction
+    );
+
+
+    this._map.on(
+      "zoomend",
+      () => {
+
+        finishInteraction(true);
       }
     );
 
@@ -1399,17 +1484,15 @@ class HANeptunMap extends HTMLElement {
       "moveend",
       () => {
 
-        this.updateThreatAppearance(
-          false
-        );
+        /*
+         * zoomend is followed by moveend in common Leaflet zoom
+         * paths. Running the full expensive pipeline twice is
+         * unnecessary; updateThreatAppearance() coalesces the
+         * clustering pass and the remaining work is cheap enough
+         * to run once after the final move event.
+         */
 
-        this.updateMapLabels();
-        this.updateRaionDisplay();
-
-        requestAnimationFrame(
-          () =>
-            this.applyRaionOblastClip()
-        );
+        finishInteraction(false);
       }
     );
 
@@ -3438,14 +3521,23 @@ class HANeptunMap extends HTMLElement {
       return null;
 
 
-    let level = null;
+    return (
+      this._raionAlertLevels.get(
+        featureName
+      ) || null
+    );
+  }
+
+
+  rebuildAlertIndexes() {
+
+    const raions =
+      new Map();
 
 
     for (
       const alert
-      of (
-        this._snapshot.alerts || []
-      )
+      of (this._snapshot.alerts || [])
     ) {
 
       if (
@@ -3455,7 +3547,7 @@ class HANeptunMap extends HTMLElement {
         continue;
 
 
-      const alertName =
+      const name =
         this.normalizeRaionName(
           alert.name ||
           alert.raion ||
@@ -3464,14 +3556,11 @@ class HANeptunMap extends HTMLElement {
         );
 
 
-      if (
-        !alertName ||
-        alertName !== featureName
-      )
+      if (!name)
         continue;
 
 
-      const alertLevel =
+      const level =
         String(
           alert.level || ""
         )
@@ -3479,16 +3568,26 @@ class HANeptunMap extends HTMLElement {
           .trim();
 
 
-      if (alertLevel === "red")
-        return "red";
+      const previous =
+        raions.get(name);
 
 
-      if (alertLevel === "yellow")
-        level = "yellow";
+      if (
+        level === "red" ||
+        (
+          level === "yellow" &&
+          previous !== "red"
+        )
+      )
+        raions.set(
+          name,
+          level
+        );
     }
 
 
-    return level;
+    this._raionAlertLevels =
+      raions;
   }
 
 
@@ -3551,7 +3650,7 @@ class HANeptunMap extends HTMLElement {
     if (
       !this._map ||
       !this._raionLayer ||
-      !this._oblastGeoJSON
+      !this._oblastLayer
     )
       return;
 
@@ -3572,167 +3671,245 @@ class HANeptunMap extends HTMLElement {
       return;
 
 
-    let defs =
-      svg.querySelector(
-        "defs[data-neptun-clips]"
+    /*
+     * Build district -> oblast ownership only once.
+     *
+     * The old implementation repeated getBounds(), pointInFeature()
+     * and Array.find() for every district after every move/zoom.
+     * That was particularly expensive in Safari/WKWebView.
+     */
+    if (!this._raionClipAssignments) {
+
+      const oblasts = [];
+
+
+      this._oblastLayer.eachLayer(
+        layer => {
+
+          if (
+            !layer.feature ||
+            !layer._path
+          )
+            return;
+
+
+          const name =
+            this.normalizeName(
+              this.getOblastName(
+                layer.feature
+              )
+            );
+
+
+          if (!name)
+            return;
+
+
+          oblasts.push({
+            feature:layer.feature,
+            layer,
+            id:
+              "neptun-oblast-clip-" +
+              name.replace(
+                /[^a-zа-яіїєґ0-9]+/gi,
+                "-"
+              )
+          });
+        }
       );
 
 
-    if (defs)
-      defs.remove();
+      const assignments = [];
 
 
-    defs = null;
+      this._raionLayer.eachLayer(
+        district => {
+
+          if (
+            !district.feature ||
+            !district._path
+          )
+            return;
 
 
-    if (!defs) {
+          const center =
+            district.getBounds()
+              .getCenter();
 
-      defs =
-        document.createElementNS(
-          "http://www.w3.org/2000/svg",
-          "defs"
-        );
 
-      defs.setAttribute(
-        "data-neptun-clips",
-        "1"
+          const oblast =
+            oblasts.find(
+              item =>
+                this.pointInFeature(
+                  center.lat,
+                  center.lng,
+                  item.feature
+                )
+            );
+
+
+          if (oblast)
+            assignments.push({
+              district,
+              oblast
+            });
+        }
       );
 
-      svg.insertBefore(
-        defs,
-        svg.firstChild
-      );
+
+      this._raionClipAssignments =
+        assignments;
     }
 
 
     /*
-     * Один clipPath на область. Координати беремо безпосередньо
-     * з еталонного oblast layer, тому clip завжди збігається
-     * з білим контуром області навіть після zoom/pan.
+     * Keep one persistent <defs>. Recreating all clipPath nodes on
+     * every moveend/zoomend caused avoidable SVG DOM churn.
      */
-
-    const oblasts = [];
-
-
-    this._oblastLayer.eachLayer(
-      layer => {
-
-        if (
-          !layer.feature ||
-          !layer._path
-        )
-          return;
+    let defs =
+      this._raionClipDefs;
 
 
-        oblasts.push({
-          feature:layer.feature,
-          layer
-        });
-      }
-    );
-
-
-    for (
-      const district
-      of this._raionLayer.getLayers()
+    if (
+      !defs ||
+      defs.ownerSVGElement !== svg
     ) {
 
+      defs =
+        svg.querySelector(
+          "defs[data-neptun-clips]"
+        );
+
+
+      if (!defs) {
+
+        defs =
+          document.createElementNS(
+            "http://www.w3.org/2000/svg",
+            "defs"
+          );
+
+        defs.setAttribute(
+          "data-neptun-clips",
+          "1"
+        );
+
+        svg.insertBefore(
+          defs,
+          svg.firstChild
+        );
+      }
+
+
+      this._raionClipDefs = defs;
+      this._raionClipPaths.clear();
+    }
+
+
+    /*
+     * Leaflet changes the oblast SVG path's "d" on zoom. Copy only
+     * that geometry into our persistent clip paths. No node removal,
+     * clone storm or district ownership calculation is needed.
+     */
+    for (
+      const item
+      of this._raionClipAssignments
+    ) {
+
+      const {
+        district,
+        oblast
+      } = item;
+
+
       if (
-        !district.feature ||
-        !district._path
+        !district._path ||
+        !oblast.layer._path
       )
         continue;
 
 
-      const center =
-        district.getBounds()
-          .getCenter();
-
-
-      const oblast =
-        oblasts.find(
-          item =>
-            this.pointInFeature(
-              center.lat,
-              center.lng,
-              item.feature
-            )
+      let clipPath =
+        this._raionClipPaths.get(
+          oblast.id
         );
 
 
-      if (!oblast)
-        continue;
+      if (!clipPath) {
 
-
-      const name =
-        this.normalizeName(
-          this.getOblastName(
-            oblast.feature
-          )
-        );
-
-
-      const id =
-        "neptun-oblast-clip-" +
-        name.replace(
-          /[^a-zа-яіїєґ0-9]+/gi,
-          "-"
-        );
-
-
-      let clip =
-        defs.querySelector(
-          "#" +
-          CSS.escape(id)
-        );
-
-
-      if (!clip) {
-
-        clip =
+        const clip =
           document.createElementNS(
             "http://www.w3.org/2000/svg",
             "clipPath"
           );
 
-        clip.id = id;
+        clip.id =
+          oblast.id;
 
 
-        const path =
-          oblast.layer._path
-            .cloneNode(false);
+        clipPath =
+          document.createElementNS(
+            "http://www.w3.org/2000/svg",
+            "path"
+          );
 
-
-        path.removeAttribute(
-          "class"
-        );
-
-        path.removeAttribute(
-          "style"
-        );
-
-        path.setAttribute(
+        clipPath.setAttribute(
           "fill",
           "#000"
         );
 
-        path.setAttribute(
+        clipPath.setAttribute(
           "stroke",
           "none"
         );
 
-        clip.appendChild(path);
-        defs.appendChild(clip);
+        clip.appendChild(
+          clipPath
+        );
+
+        defs.appendChild(
+          clip
+        );
+
+        this._raionClipPaths.set(
+          oblast.id,
+          clipPath
+        );
       }
 
 
-      district._path.setAttribute(
-        "clip-path",
-        `url(#${id})`
-      );
+      const d =
+        oblast.layer._path
+          .getAttribute(
+            "d"
+          );
+
+
+      if (
+        d &&
+        clipPath.getAttribute("d") !== d
+      )
+        clipPath.setAttribute(
+          "d",
+          d
+        );
+
+
+      const expected =
+        `url(#${oblast.id})`;
+
+
+      if (
+        district._path.getAttribute(
+          "clip-path"
+        ) !== expected
+      )
+        district._path.setAttribute(
+          "clip-path",
+          expected
+        );
     }
   }
-
 
   buildInternalRaionBoundaries(geojson) {
 
@@ -3988,13 +4165,24 @@ class HANeptunMap extends HTMLElement {
        * більше немає.
        */
 
+      /*
+       * Do NOT instantiate the nationwide district polygons twice.
+       *
+       * The fill layer above already owns all district polygons.
+       * For visible district borders we only need shared internal
+       * line segments, so build one lightweight MultiLineString.
+       * This removes the second full set of Leaflet polygon paths
+       * from the DOM and cuts projection work during zoom.
+       */
       this._raionBoundaryGeoJSON =
-        geojson;
+        this.buildInternalRaionBoundaries(
+          geojson
+        );
 
 
       this._raionBoundaryLayer =
         L.geoJSON(
-          geojson,
+          this._raionBoundaryGeoJSON,
           {
             pane:"raions",
             interactive:false,
@@ -4203,21 +4391,11 @@ class HANeptunMap extends HTMLElement {
 
   refreshRaions() {
 
-    if (!this._raionLayer)
-      return;
-
-
-    this._raionLayer.eachLayer(
-      layer => {
-
-        layer.setStyle(
-          this.raionStyle(
-            layer.feature
-          )
-        );
-      }
-    );
-
+    /*
+     * updateRaionDisplay() already applies the complete fill and
+     * boundary style. A separate full setStyle() pass here used to
+     * style every district twice for each realtime snapshot.
+     */
 
     this.updateRaionDisplay();
   }
@@ -4275,59 +4453,33 @@ class HANeptunMap extends HTMLElement {
 
     if (this._raionBoundaryLayer) {
 
-      const palette =
-        this.mapPalette();
+      /*
+       * Boundary geometry is now a single internal-line layer,
+       * not a second copy of every district polygon. Style it once.
+       */
+      this._raionBoundaryLayer.setStyle({
+        color:
+          this.isLightTheme()
+            ? "rgba(74,88,98,.42)"
+            : "rgba(176,191,199,.34)",
 
+        weight:
+          showBoundary
+            ? (
+                delta >= 3.5
+                  ? .72
+                  : .62
+              )
+            : 0,
 
-      this._raionBoundaryLayer.eachLayer(
-        layer => {
+        opacity:
+          showBoundary
+            ? .9
+            : 0,
 
-          const level =
-            this.getRaionAlertLevel(
-              layer.feature
-            );
-
-
-          let color;
-
-
-          if (level === "red")
-            color =
-              palette.redStroke;
-
-          else if (level === "yellow")
-            color =
-              palette.yellowStroke;
-
-          else
-            color =
-              this.isLightTheme()
-                ? "rgba(74,88,98,.42)"
-                : "rgba(176,191,199,.34)";
-
-
-          layer.setStyle({
-            color,
-
-            weight:
-              showBoundary
-                ? (
-                    delta >= 3.5
-                      ? .72
-                      : .62
-                  )
-                : 0,
-
-            opacity:
-              showBoundary
-                ? .9
-                : 0,
-
-            fill:false,
-            fillOpacity:0
-          });
-        }
-      );
+        fill:false,
+        fillOpacity:0
+      });
     }
 
 
@@ -5536,6 +5688,13 @@ class HANeptunMap extends HTMLElement {
 
           this._snapshot =
             snapshot;
+
+
+          /*
+           * Build alert lookup tables once. District style functions
+           * are called many times by Leaflet and must stay O(1).
+           */
+          this.rebuildAlertIndexes();
 
 
           /*
@@ -6989,6 +7148,14 @@ class HANeptunMap extends HTMLElement {
         );
 
 
+        /*
+         * New marker already owns the correct icon; store its
+         * signature after the common update block below decides
+         * whether a replacement is needed.
+         */
+        marker._iconSignature = null;
+
+
         marker.on(
           "click",
           e => {
@@ -7020,6 +7187,25 @@ class HANeptunMap extends HTMLElement {
       }
 
 
+      /*
+       * Rebuilding a Leaflet divIcon replaces marker DOM. Realtime
+       * snapshots can arrive even when the visual icon did not
+       * change, so keep a compact visual signature and only touch
+       * the DOM when necessary.
+       */
+
+      const iconSignature = [
+        this.getThreatModel(threat),
+        threat.type || "",
+        threat.heading ?? "",
+        threat.areaOnly ? 1 : 0,
+        threat.title || "",
+        window.NEPTUN?.getTypeMeta?.(
+          threat.type
+        )?.color || ""
+      ].join("|");
+
+
       marker._threat =
         threat;
 
@@ -7031,11 +7217,20 @@ class HANeptunMap extends HTMLElement {
         );
 
 
-      marker.setIcon(
-        this.makeThreatIcon(
-          threat
-        )
-      );
+      if (
+        marker._iconSignature !==
+        iconSignature
+      ) {
+
+        marker.setIcon(
+          this.makeThreatIcon(
+            threat
+          )
+        );
+
+        marker._iconSignature =
+          iconSignature;
+      }
     }
 
 
@@ -7066,12 +7261,44 @@ class HANeptunMap extends HTMLElement {
       this.getZoomBucket();
 
 
-    requestAnimationFrame(
-      () => {
+    this.scheduleThreatClustering();
+  }
 
-        this.applyThreatClustering();
-      }
-    );
+
+  /*
+   * Coalesce all clustering requests into one animation frame.
+   * Snapshot, zoom/move end and prediction can request a refresh
+   * almost simultaneously; only the newest map state matters.
+   */
+  scheduleThreatClustering() {
+
+    if (
+      !this._map ||
+      this._mapInteracting ||
+      this._clusterPending
+    )
+      return;
+
+
+    this._clusterPending = true;
+
+
+    this._clusterRaf =
+      requestAnimationFrame(
+        () => {
+
+          this._clusterPending = false;
+          this._clusterRaf = null;
+
+          if (
+            !this._map ||
+            this._mapInteracting
+          )
+            return;
+
+          this.applyThreatClustering();
+        }
+      );
   }
 
 
@@ -7127,12 +7354,7 @@ class HANeptunMap extends HTMLElement {
     }
 
 
-    requestAnimationFrame(
-      () => {
-
-        this.applyThreatClustering();
-      }
-    );
+    this.scheduleThreatClustering();
   }
 
 
@@ -7142,7 +7364,10 @@ class HANeptunMap extends HTMLElement {
 
   applyThreatClustering() {
 
-    if (!this._map)
+    if (
+      !this._map ||
+      this._mapInteracting
+    )
       return;
 
 
@@ -7157,16 +7382,13 @@ class HANeptunMap extends HTMLElement {
       ++this._clusterRevision;
 
 
-    for (
-      const cluster
-      of this._clusterMarkers
-    ) {
-
-      cluster.remove();
-    }
-
-
-    this._clusterMarkers = [];
+    /*
+     * Persistent cluster pool. A stable key derived from member IDs
+     * lets us reuse the same Leaflet marker across animation passes
+     * instead of remove()+new L.marker()+addTo() every time.
+     */
+    const activeClusterKeys =
+      new Set();
 
 
     const zoom =
@@ -7459,161 +7681,241 @@ class HANeptunMap extends HTMLElement {
       };
 
 
-      const cluster =
-        L.marker(
-          center,
-          {
-
-            pane:"threats",
-
-            keyboard:false,
-
-            zIndexOffset:1200,
-
-            icon:
-              this.makeThreatIcon(
-                clusterThreat
+      const clusterKey =
+        members
+          .map(
+            item =>
+              String(
+                item.threat?.id || ""
               )
-          }
-        )
-        .addTo(
-          this._map
+          )
+          .sort()
+          .join("|");
+
+
+      activeClusterKeys.add(
+        clusterKey
+      );
+
+
+      let cluster =
+        this._clusterPool.get(
+          clusterKey
         );
 
 
-      /*
-       * Кластер — це група, тому клік не відкриває
-       * картку representative-цілі. Він завжди
-       * розкриває групу зумом.
-       *
-       * members — окрема копія складу саме цього
-       * кластеру, тому наступний realtime update
-       * не може підмінити click-handler.
-       */
-
-      /*
-       * Кластери перераховуються під час анімації руху.
-       * На desktop звичайний click може загубитися, якщо
-       * marker був перебудований між mousedown і mouseup.
-       *
-       * Тому для миші реагуємо вже на mousedown.
-       * Touch залишаємо на звичайному click, щоб не ламати
-       * pinch/drag на телефоні.
-       */
-
-      const openCluster =
-        e => {
-
-          L.DomEvent
-            .stopPropagation(
-              e
-            );
+      const clusterIconSignature = [
+        this.getThreatModel(
+          clusterThreat
+        ),
+        clusterThreat.type || "",
+        clusterThreat.heading ?? "",
+        count,
+        window.NEPTUN?.getTypeMeta?.(
+          clusterThreat.type
+        )?.color || "",
+        this.getZoomBucket()
+      ].join("|");
 
 
-          const bounds =
-            L.latLngBounds(
-              members.map(
-                item =>
-                  item.latlng
-              )
-            );
+      if (!cluster) {
+
+        cluster =
+          L.marker(
+            center,
+            {
+              pane:"threats",
+              keyboard:false,
+              zIndexOffset:1200,
+              icon:
+                this.makeThreatIcon(
+                  clusterThreat
+                )
+            }
+          )
+          .addTo(
+            this._map
+          );
 
 
-          if (
-            bounds.isValid() &&
-            !bounds.getNorthEast()
-              .equals(
-                bounds.getSouthWest()
-              )
-          ) {
+        cluster._clusterIconSignature =
+          clusterIconSignature;
 
-            this._map.fitBounds(
-              bounds,
-              {
-                padding:[45,45],
-                maxZoom:11,
-                animate:true
-              }
-            );
 
+        /*
+         * Event handlers are attached once for the lifetime of the
+         * pooled marker. Current members/center are stored on the
+         * marker and refreshed below on every clustering pass.
+         */
+        const openCluster =
+          e => {
+
+            L.DomEvent
+              .stopPropagation(
+                e
+              );
+
+
+            const currentMembers =
+              cluster._clusterMembers ||
+              [];
+
+
+            const currentCenter =
+              cluster._clusterCenter ||
+              cluster.getLatLng();
+
+
+            const bounds =
+              L.latLngBounds(
+                currentMembers.map(
+                  item =>
+                    item.latlng
+                )
+              );
+
+
+            if (
+              bounds.isValid() &&
+              !bounds.getNorthEast()
+                .equals(
+                  bounds.getSouthWest()
+                )
+            ) {
+
+              this._map.fitBounds(
+                bounds,
+                {
+                  padding:[45,45],
+                  maxZoom:11,
+                  animate:true
+                }
+              );
+
+            }
+
+            else {
+
+              this._map.setView(
+                currentCenter,
+                Math.min(
+                  11,
+                  this._map.getZoom() + 2
+                ),
+                {
+                  animate:true
+                }
+              );
+            }
+          };
+
+
+        cluster.on(
+          "mousedown",
+          e => {
+
+            const original =
+              e.originalEvent;
+
+
+            if (
+              original &&
+              original.button === 0
+            )
+              openCluster(e);
           }
-
-          else {
-
-            this._map.setView(
-              center,
-              Math.min(
-                11,
-                this._map.getZoom() + 2
-              ),
-              {
-                animate:true
-              }
-            );
-          }
-        };
+        );
 
 
-      cluster.on(
-        "mousedown",
-        e => {
+        cluster.on(
+          "click",
+          e => {
 
-          const original =
-            e.originalEvent;
+            const original =
+              e.originalEvent;
 
 
-          if (
-            original &&
-            original.button === 0
-          ) {
+            if (
+              original &&
+              original.pointerType === "mouse"
+            )
+              return;
 
-            /*
-             * Не перевіряємо revision тут: саме перебудова
-             * кожні ~100 ms і була причиною втрати desktop click.
-             */
 
             openCluster(e);
           }
+        );
+
+
+        this._clusterPool.set(
+          clusterKey,
+          cluster
+        );
+
+      }
+
+      else {
+
+        cluster.setLatLng(
+          center
+        );
+
+
+        if (
+          cluster._clusterIconSignature !==
+          clusterIconSignature
+        ) {
+
+          cluster.setIcon(
+            this.makeThreatIcon(
+              clusterThreat
+            )
+          );
+
+          cluster._clusterIconSignature =
+            clusterIconSignature;
         }
-      );
+      }
 
 
-      cluster.on(
-        "click",
-        e => {
+      cluster._clusterMembers =
+        members;
 
-          /*
-           * На desktop дію вже виконав mousedown.
-           * click потрібен для touch/tap.
-           */
+      cluster._clusterCenter =
+        center;
 
-          const original =
-            e.originalEvent;
+      cluster._clusterRevision =
+        revision;
+    }
 
 
-          if (
-            original &&
-            original.pointerType === "mouse"
-          )
-            return;
+    /*
+     * Remove only clusters whose membership disappeared. Stable
+     * groups remain mounted in the DOM and are simply repositioned.
+     */
+    for (
+      const [key,cluster]
+      of this._clusterPool
+    ) {
+
+      if (
+        activeClusterKeys.has(
+          key
+        )
+      )
+        continue;
 
 
-          if (
-            revision !==
-            this._clusterRevision
-          )
-            return;
+      cluster.remove();
 
-
-          openCluster(e);
-        }
-      );
-
-
-      this._clusterMarkers.push(
-        cluster
+      this._clusterPool.delete(
+        key
       );
     }
+
+
+    this._clusterMarkers =
+      [...this._clusterPool.values()];
   }
 
 
@@ -8182,30 +8484,24 @@ class HANeptunMap extends HTMLElement {
       return;
 
 
-    let lastSeparation =
-      0;
-
-
-    let lastPrediction =
-      0;
-
-
+    /*
+     * requestAnimationFrame still wakes up every display frame even
+     * when we immediately return. Keep the loop, but do real NEPTUN
+     * prediction at 10 Hz and clustering at most ~3 Hz, only when
+     * coordinates actually changed.
+     */
     const frame = timestamp => {
 
-      if (!this._map)
+      if (!this._map) {
+
+        this._animation = null;
         return;
+      }
 
-
-      /*
-       * На мобільному HA (особливо iOS WKWebView) немає сенсу
-       * рахувати прогноз координат 60 разів/с. 20 FPS достатньо
-       * для плавного руху цілей і суттєво зменшує CPU load.
-       */
 
       if (
-        timestamp -
-        lastPrediction <
-        50
+        this._mapInteracting ||
+        document.hidden
       ) {
 
         this._animation =
@@ -8217,7 +8513,22 @@ class HANeptunMap extends HTMLElement {
       }
 
 
-      lastPrediction =
+      if (
+        timestamp -
+        this._animationLastPrediction <
+        this._predictionInterval
+      ) {
+
+        this._animation =
+          requestAnimationFrame(
+            frame
+          );
+
+        return;
+      }
+
+
+      this._animationLastPrediction =
         timestamp;
 
 
@@ -8225,11 +8536,9 @@ class HANeptunMap extends HTMLElement {
         Date.now();
 
 
-      /*
-       * -------------------------------------------------------
-       * PREDICT MOVING TARGET POSITIONS
-       * -------------------------------------------------------
-       */
+      let moved =
+        false;
+
 
       for (
         const marker
@@ -8240,22 +8549,16 @@ class HANeptunMap extends HTMLElement {
           marker._threat;
 
 
-        if (!threat)
-          continue;
-
-
-        if (threat.areaOnly)
+        if (
+          !threat ||
+          threat.areaOnly
+        )
           continue;
 
 
         let predicted =
           null;
 
-
-        /*
-         * Використовуємо саме predictor
-         * з NEPTUN SDK.
-         */
 
         try {
 
@@ -8278,41 +8581,19 @@ class HANeptunMap extends HTMLElement {
 
 
         let lat =
-          null;
+          Number(
+            predicted?.lat ??
+            predicted?.latitude
+          );
 
 
         let lon =
-          null;
+          Number(
+            predicted?.lon ??
+            predicted?.lng ??
+            predicted?.longitude
+          );
 
-
-        /*
-         * NEPTUN predictor може повернути
-         * звичайний object.
-         */
-
-        if (predicted) {
-
-          lat =
-            Number(
-              predicted.lat ??
-              predicted.latitude
-            );
-
-
-          lon =
-            Number(
-              predicted.lon ??
-              predicted.lng ??
-              predicted.longitude
-            );
-        }
-
-
-        /*
-         * Якщо predictor нічого корисного
-         * не повернув — використовуємо
-         * координату зі snapshot.
-         */
 
         if (
           !Number.isFinite(lat) ||
@@ -8323,7 +8604,6 @@ class HANeptunMap extends HTMLElement {
             Number(
               threat.lat
             );
-
 
           lon =
             Number(
@@ -8339,34 +8619,44 @@ class HANeptunMap extends HTMLElement {
           continue;
 
 
-        marker._predictedLatLng =
-          L.latLng(
-            lat,
-            lon
-          );
+        const previous =
+          marker._predictedLatLng;
+
+
+        if (
+          !previous ||
+          Math.abs(previous.lat - lat) >
+            this._clusterMoveEpsilon ||
+          Math.abs(previous.lng - lon) >
+            this._clusterMoveEpsilon
+        ) {
+
+          marker._predictedLatLng =
+            L.latLng(
+              lat,
+              lon
+            );
+
+          moved = true;
+        }
       }
 
 
       /*
-       * -------------------------------------------------------
-       * CLUSTERING
-       * -------------------------------------------------------
-       *
-       * Не ганяємо clustering 60 разів/сек.
-       *
-       * ~5 разів/сек достатньо для кластерів, а на iOS
-       * це помітно зменшує кількість DOM/SVG перебудов.
+       * Static snapshots no longer rebuild cluster marker DOM forever.
+       * A cluster pass happens only after meaningful predicted movement,
+       * and is rate-limited independently from prediction.
        */
-
       if (
+        moved &&
         timestamp -
-        lastSeparation >
-        200
+          this._animationLastCluster >=
+          this._clusterInterval
       ) {
 
-        this.applyThreatClustering();
+        this.scheduleThreatClustering();
 
-        lastSeparation =
+        this._animationLastCluster =
           timestamp;
       }
 
@@ -8378,12 +8668,15 @@ class HANeptunMap extends HTMLElement {
     };
 
 
+    this._animationLastPrediction = 0;
+    this._animationLastCluster = 0;
+
+
     this._animation =
       requestAnimationFrame(
         frame
       );
   }
-
 
   /* =========================================================
      STATUS
@@ -8519,6 +8812,27 @@ class HANeptunMap extends HTMLElement {
     }
 
 
+    this._animationLastPrediction = 0;
+    this._animationLastCluster = 0;
+
+
+    /*
+     * Pending clustering frame.
+     */
+
+    if (
+      this._clusterRaf
+    ) {
+
+      cancelAnimationFrame(
+        this._clusterRaf
+      );
+
+      this._clusterRaf = null;
+      this._clusterPending = false;
+    }
+
+
     /*
      * ResizeObserver.
      */
@@ -8618,6 +8932,22 @@ class HANeptunMap extends HTMLElement {
 
     this._markers.clear();
 
+
+    for (
+      const cluster
+      of this._clusterPool.values()
+    ) {
+
+      try {
+        cluster.remove();
+      }
+      catch(e) {}
+    }
+
+
+    this._clusterPool.clear();
+    this._clusterMarkers = [];
+
     this._oblastLabels = [];
 
     this._cityLabels = [];
@@ -8632,6 +8962,9 @@ class HANeptunMap extends HTMLElement {
     this._raionLayer = null;
     this._raionBoundaryLayer = null;
     this._raionBoundaryGeoJSON = null;
+    this._raionClipAssignments = null;
+    this._raionClipDefs = null;
+    this._raionClipPaths.clear();
     this._oblastLayer = null;
     this._oblastBorderLayer = null;
     this._oblastGeoJSON = null;
@@ -8699,6 +9032,6 @@ if (
    =========================================================== */
 
 console.info(
-  "%c HA NEPTUN MAP v0.0.1-alpha.2 ",
+  "%c HA NEPTUN MAP v0.0.1-beta.1 ",
   "background:#263238;color:#fff;padding:3px 7px;border-radius:4px;font-weight:bold;"
 );
