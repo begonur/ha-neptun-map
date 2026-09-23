@@ -8699,6 +8699,6 @@ if (
    =========================================================== */
 
 console.info(
-  "%c HA NEPTUN MAP v0.0.1-alpha.1 ",
+  "%c HA NEPTUN MAP v0.0.1-alpha.2 ",
   "background:#263238;color:#fff;padding:3px 7px;border-radius:4px;font-weight:bold;"
 );
