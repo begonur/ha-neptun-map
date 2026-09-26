@@ -20,21 +20,12 @@ class HANeptunMap extends HTMLElement {
 
     this._raionLayer = null;
     this._raionBoundaryLayer = null;
-    this._raionBoundaryGeoJSON = null;
+    this._raionLayersByName = new Map();
+    this._raionFeaturesByName = new Map();
     this._oblastBorderLayer = null;
 
-    /*
-     * Phase 3 performance caches.
-     *
-     * District -> oblast ownership never changes after GeoJSON load,
-     * so do the expensive point-in-polygon lookup once. SVG clip
-     * nodes are also kept and only their path geometry is refreshed
-     * after Leaflet finishes a zoom.
-     */
-    this._raionClipAssignments = null;
-    this._raionClipDefs = null;
-    this._raionClipPaths = new Map();
     this._raionCenterLabels = [];
+    this._appliedRaionAlertLevels = new Map();
     this._raionsLoaded = false;
 
     this._kyivBoundary = null;
@@ -68,6 +59,25 @@ class HANeptunMap extends HTMLElement {
     this._clusterRaf = null;
 
     /*
+     * iOS/WebKit interaction coalescing.
+     * A pinch commonly emits zoomend followed by moveend. Keep one
+     * post-interaction frame and preserve the strongest (zoom) request.
+     */
+    this._interactionFinishRaf = null;
+    this._interactionForceIcons = false;
+    this._labelCollisionRaf = null;
+    this._mapWheelGuard = null;
+
+    /*
+     * Expensive visual layers are updated only when their effective
+     * state changes. Panning at the same zoom must not restyle every
+     * district or rewrite every label.
+     */
+    this._lastLabelDisplayKey = null;
+    this._lastRaionDisplayKey = null;
+    this._heavyLayersScheduled = false;
+
+    /*
      * Prediction / clustering scheduler.
      *
      * Moving targets only need work while the card is visible.
@@ -87,7 +97,7 @@ class HANeptunMap extends HTMLElement {
      * O(districts × alerts) on every style/update pass.
      */
     this._raionAlertLevels = new Map();
-    this._oblastAlertLevels = new Map();
+    this._oblastBorderTheme = null;
   }
 
 
@@ -1090,135 +1100,56 @@ class HANeptunMap extends HTMLElement {
      ========================================================= */
 
   scheduleStart() {
-
-    if (this._startScheduled)
-      return;
-
-
+    if (this._startScheduled) return;
     this._startScheduled = true;
-
-
-    /*
-     * requestIdleCallback сам по собі тут недостатній:
-     * під час побудови Lovelace браузер може вважати коротку
-     * паузу "idle" і запустити NEPTUN ще ДО того, як HA
-     * закінчив малювати решту dashboard.
-     *
-     * Тому спочатку даємо Home Assistant гарантоване вікно
-     * для стартового рендера, і лише потім просимо idle slot.
-     */
-
-    setTimeout(
-      () => {
-
-        const run =
-          () => {
-
-            requestAnimationFrame(
-              () => {
-
-                requestAnimationFrame(
-                  () => {
-
-                    this._startScheduled = false;
-
-                    if (
-                      this.isConnected &&
-                      !this._map
-                    )
-                      this.start();
-                  }
-                );
-              }
-            );
-          };
-
-
-        if (
-          "requestIdleCallback"
-          in window
-        ) {
-
-          window.requestIdleCallback(
-            run,
-            {
-              timeout:2000
-            }
-          );
-
-        }
-
-        else {
-
-          run();
-        }
-      },
-      1500
-    );
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      this._startScheduled = false;
+      if (this.isConnected && !this._map) this.start();
+    }));
   }
-
 
   async start() {
 
-    try {
+    const mark = () => {};
 
-      this.status(
-        "Завантаження карти…"
-      );
+    try {
+      this.status("Завантаження карти…");
 
       await this.loadLeaflet();
+      mark("Leaflet ready");
 
       this.createMap();
+      mark("map created");
 
+      await new Promise(resolve => requestAnimationFrame(resolve));
 
-      /*
-       * Віддаємо main thread браузеру між важкими етапами.
-       * Це прибирає відчуття, що NEPTUN затримує всі інші cards.
-       */
-
-      await new Promise(
-        resolve =>
-          requestAnimationFrame(
-            () => resolve()
-          )
-      );
-
-
+      /* Base geography owns map startup. NEPTUN SDK is independent and must
+       * never hold the visible map behind a slow CDN/script response. */
+      const ukraineT0 = performance.now();
       await this.loadUkraine();
+      mark("base map ready");
 
+      this.status("NEPTUN: підключення…");
+      this._startupMark = mark;
 
-      await new Promise(
-        resolve =>
-          requestAnimationFrame(
-            () => resolve()
-          )
-      );
-
-
-      this.status(
-        "NEPTUN: підключення…"
-      );
-
-      await this.loadSDK();
-
-      this.connectNeptun();
-
+      /* Connect realtime in parallel with district/cache work already
+       * scheduled by loadUkraine(). Do not await it on the map path. */
+      const sdkT0 = performance.now();
+      this.loadSDK()
+        .then(() => {
+          mark("SDK ready");
+          if (this._map) this.connectNeptun();
+        })
+        .catch(e => {
+          console.error("NEPTUN CARD: SDK:",e);
+          if (this._map) this.status("NEPTUN: помилка підключення");
+        });
     }
-
     catch(e) {
-
-      console.error(
-        "NEPTUN CARD:",
-        e
-      );
-
-      this.status(
-        "Помилка: " +
-        (e.message || e)
-      );
+      console.error("NEPTUN CARD:",e);
+      this.status("Помилка: " + (e.message || e));
     }
   }
-
 
   /* =========================================================
      LEAFLET
@@ -1323,7 +1254,17 @@ class HANeptunMap extends HTMLElement {
           keyboard:false,
           tap:true
         }
-      );
+      )
+
+    /* Keep desktop wheel ownership deterministic inside the map. Leaflet can
+     * let wheel events escape at zoom limits / during wheel debounce, which
+     * makes Lovelace scroll underneath the cursor. A non-passive native guard
+     * prevents the page scroll while leaving Leaflet's own zoom handler intact. */
+    this._mapWheelGuard = event => {
+      if (event.ctrlKey || event.metaKey) return;
+      event.preventDefault();
+    };
+    element.addEventListener("wheel",this._mapWheelGuard,{passive:false});;
 
 
     /*
@@ -1333,12 +1274,24 @@ class HANeptunMap extends HTMLElement {
      */
 
     this._map.createPane(
-      "raions"
+      "raionFills"
     );
-
     this._map.getPane(
-      "raions"
-    ).style.zIndex = 415;
+      "raionFills"
+    ).style.zIndex = 414;
+    this._map.getPane(
+      "raionFills"
+    ).style.pointerEvents = "none";
+
+    this._map.createPane(
+      "raionBorders"
+    );
+    this._map.getPane(
+      "raionBorders"
+    ).style.zIndex = 416;
+    this._map.getPane(
+      "raionBorders"
+    ).style.pointerEvents = "none";
 
 
     this._map.createPane(
@@ -1437,31 +1390,44 @@ class HANeptunMap extends HTMLElement {
       };
 
 
-    const finishInteraction =
+    const scheduleFinishInteraction =
       forceIcons => {
 
-        this._mapInteracting = false;
+        this._interactionForceIcons =
+          this._interactionForceIcons ||
+          forceIcons;
 
-        this.updateThreatAppearance(
-          forceIcons
-        );
 
-        this.updateMapLabels();
-        this.updateRaionDisplay();
-        this.updateKyivBoundary();
+        if (this._interactionFinishRaf)
+          return;
 
-        requestAnimationFrame(
-          () => {
 
-            if (
-              !this._map ||
-              this._mapInteracting
-            )
-              return;
+        this._interactionFinishRaf =
+          requestAnimationFrame(
+            () => {
 
-            this.applyRaionOblastClip();
-          }
-        );
+              this._interactionFinishRaf = null;
+
+              if (!this._map)
+                return;
+
+
+              const refreshIcons =
+                this._interactionForceIcons;
+
+              this._interactionForceIcons = false;
+              this._mapInteracting = false;
+
+
+              /* Restore normal UI work. District alert polygons are persistent vectors, but only
+               * currently alerted districts stay attached to Leaflet. */
+              this.updateRaionDisplay();
+              this.updateKyivBoundary();
+              this.updateMapLabels();
+              this.updateThreatAppearance(refreshIcons);
+
+            }
+          );
       };
 
 
@@ -1473,27 +1439,15 @@ class HANeptunMap extends HTMLElement {
 
     this._map.on(
       "zoomend",
-      () => {
-
-        finishInteraction(true);
-      }
+      () =>
+        scheduleFinishInteraction(true)
     );
 
 
     this._map.on(
       "moveend",
-      () => {
-
-        /*
-         * zoomend is followed by moveend in common Leaflet zoom
-         * paths. Running the full expensive pipeline twice is
-         * unnecessary; updateThreatAppearance() coalesces the
-         * clustering pass and the remaining work is cheap enough
-         * to run once after the final move event.
-         */
-
-        finishInteraction(false);
-      }
+      () =>
+        scheduleFinishInteraction(false)
     );
 
 
@@ -1556,8 +1510,6 @@ class HANeptunMap extends HTMLElement {
 
     const URL =
       "https://cdn.jsdelivr.net/gh/darmat1/ukraine-geo-data@main/geodata/Ukraine.geojson";
-
-
     let geojson = null;
 
 
@@ -1569,11 +1521,7 @@ class HANeptunMap extends HTMLElement {
         );
 
       if (cached) {
-
-        geojson =
-          JSON.parse(
-            cached
-          );
+        geojson = JSON.parse(cached);
       }
 
     }
@@ -1581,11 +1529,7 @@ class HANeptunMap extends HTMLElement {
 
 
     if (!geojson) {
-
-      const response =
-        await fetch(
-          URL
-        );
+      const response = await fetch(URL);
 
       if (!response.ok) {
 
@@ -1594,9 +1538,7 @@ class HANeptunMap extends HTMLElement {
           response.status
         );
       }
-
-      geojson =
-        await response.json();
+      geojson = await response.json();
 
 
       try {
@@ -1612,11 +1554,6 @@ class HANeptunMap extends HTMLElement {
       catch(e) {}
     }
 
-
-    /*
-     * Зберігаємо еталонну геометрію областей. Після створення
-     * районного SVG шару використаємо її як clipPath.
-     */
     this._oblastGeoJSON = geojson;
 
 
@@ -1645,14 +1582,19 @@ class HANeptunMap extends HTMLElement {
 
 
     /*
-     * Окремий контур областей поверх районної заливки.
-     * Районний alert layer лежить вище основного oblast layer,
-     * тому без цього кольорова заливка перекривала межі областей.
+     * Keep oblast borders above district fills, but do not create a
+     * second full Leaflet polygon tree. A single MultiLineString is
+     * enough for the visible outline and is much cheaper on WebKit.
      */
+    const oblastOutlineGeoJSON =
+      this.buildPolygonOutlines(
+        geojson
+      );
+
 
     this._oblastBorderLayer =
       L.geoJSON(
-        geojson,
+        oblastOutlineGeoJSON,
         {
           pane:"oblastBorders",
           interactive:false,
@@ -1663,25 +1605,16 @@ class HANeptunMap extends HTMLElement {
                 ? "rgba(62,75,84,.82)"
                 : "rgba(224,234,239,.76)",
 
-            /*
-             * Контур області є еталонним і малюється поверх районів.
-             * Трохи ширший stroke перекриває дрібне розходження
-             * зовнішніх районних меж без зміни самої alert-заливки.
-             */
-
             weight:1.05,
             opacity:1,
             lineJoin:"round",
-            lineCap:"round",
-            fill:false,
-            fillOpacity:0
+            lineCap:"round"
           })
         }
       )
       .addTo(
         this._map
       );
-
 
     this._ukraineRealBounds =
       this._oblastLayer
@@ -1715,19 +1648,16 @@ class HANeptunMap extends HTMLElement {
      * Створюємо географічні підписи
      * тільки після завантаження областей.
      */
-
     this.createOblastLabels();
-
     this.createRegionalCenters();
 
     /*
-     * Райони вантажимо окремим шаром. Їх заливка потрібна
-     * вже на мінімальному zoom, а межі/центри покажемо лише
-     * при наближенні.
+     * Do not put nationwide district geometry on the first-paint
+     * critical path. The base map/oblasts become usable first; heavy
+     * district geometry and Kyiv boundary are attached in a later
+     * browser-idle slot. No layer is removed from the final map.
      */
-    this.loadRaions();
-
-    this.loadKyivBoundary();
+    this.scheduleHeavyMapLayers();
 
 
     /*
@@ -1744,6 +1674,23 @@ class HANeptunMap extends HTMLElement {
     );
   }
 
+
+  scheduleHeavyMapLayers() {
+    if (this._heavyLayersScheduled || !this._map) return;
+    this._heavyLayersScheduled = true;
+
+    requestAnimationFrame(() => {
+      if (this._map) this.loadRaions();
+    });
+
+    const loadKyiv = () => {
+      if (this._map) this.loadKyivBoundary();
+    };
+    if ("requestIdleCallback" in window)
+      window.requestIdleCallback(loadKyiv,{timeout:1500});
+    else
+      setTimeout(loadKyiv,100);
+  }
 
   fitUkraine() {
 
@@ -1904,110 +1851,6 @@ class HANeptunMap extends HTMLElement {
 
 
     return n;
-  }
-
-
-  getOblastAlertLevel(feature) {
-
-    const featureName =
-      this.normalizeName(
-        this.getOblastName(
-          feature
-        )
-      );
-
-
-    if (!featureName)
-      return null;
-
-
-    /*
-     * Районні alerts більше НЕ агрегуємо до області.
-     * Область фарбується лише за окремим alertOblasts fallback.
-     * Основний рівень тривоги тепер відображає районний шар.
-     */
-
-    let level = null;
-
-
-    /*
-     * Старий/агрегований alertOblasts лишаємо fallback.
-     * Якщо рівень там відсутній, трактуємо запис як red,
-     * щоб не втратити тривогу на старішій версії SDK.
-     */
-
-    for (
-      const alert
-      of (
-        this._snapshot
-          .alertOblasts || []
-      )
-    ) {
-
-      const name =
-        typeof alert === "string"
-
-          ? alert
-
-          : (
-              alert.oblast ||
-              alert.region ||
-              alert.name ||
-              ""
-            );
-
-
-      const alertName =
-        this.normalizeName(
-          name
-        );
-
-
-      if (
-        !alertName ||
-        !(
-          alertName === featureName ||
-          alertName.includes(featureName) ||
-          featureName.includes(alertName)
-        )
-      )
-        continue;
-
-
-      const alertLevel =
-        String(
-          alert?.level || ""
-        )
-          .toLowerCase()
-          .trim();
-
-
-      if (alertLevel === "red")
-        return "red";
-
-
-      if (alertLevel === "yellow") {
-
-        level = "yellow";
-
-      }
-
-      else if (!level) {
-
-        return "red";
-      }
-    }
-
-
-    return level;
-  }
-
-
-  isOblastAlert(feature) {
-
-    return !!this.getOblastAlertLevel(
-      feature
-    );
   }
 
 
@@ -2255,60 +2098,20 @@ class HANeptunMap extends HTMLElement {
 
   oblastStyle(feature) {
 
-    const level =
-      this.getOblastAlertLevel(
-        feature
-      );
-
-
     const palette =
       this.mapPalette();
 
 
-    if (level === "red") {
-
-      return {
-
-        color:palette.redStroke,
-
-        weight:1.5,
-
-        opacity:1,
-
-        fillColor:palette.redFill,
-
-        fillOpacity:1
-      };
-    }
-
-
-    if (level === "yellow") {
-
-      return {
-
-        color:palette.yellowStroke,
-
-        weight:1.5,
-
-        opacity:1,
-
-        fillColor:palette.yellowFill,
-
-        fillOpacity:1
-      };
-    }
-
-
+    /*
+     * Oblasts are geography only. Alert colouring belongs exclusively
+     * to the district layer, so we never repaint this nationwide
+     * polygon tree when realtime alert data changes.
+     */
     return {
-
       color:palette.normalStroke,
-
       weight:1,
-
       opacity:.9,
-
       fillColor:palette.normalFill,
-
       fillOpacity:
         this.isLightTheme()
           ? .92
@@ -2338,12 +2141,7 @@ class HANeptunMap extends HTMLElement {
 
           weight:2,
 
-          fillOpacity:
-            this.isOblastAlert(
-              feature
-            )
-              ? .67
-              : .46
+          fillOpacity:.46
         });
       },
 
@@ -2377,6 +2175,46 @@ class HANeptunMap extends HTMLElement {
         );
       }
     );
+
+
+    this.refreshOblastBorder();
+  }
+
+
+  refreshOblastBorder() {
+
+    if (!this._oblastBorderLayer)
+      return;
+
+
+    const theme =
+      this.isLightTheme()
+        ? "light"
+        : "dark";
+
+
+    if (
+      this._oblastBorderTheme ===
+      theme
+    )
+      return;
+
+
+    this._oblastBorderTheme =
+      theme;
+
+
+    this._oblastBorderLayer.setStyle({
+      color:
+        theme === "light"
+          ? "rgba(62,75,84,.82)"
+          : "rgba(224,234,239,.76)",
+
+      weight:1.05,
+      opacity:1,
+      lineJoin:"round",
+      lineCap:"round"
+    });
   }
 
 
@@ -2492,279 +2330,24 @@ class HANeptunMap extends HTMLElement {
   }
 
 
-  distanceToFeatureEdges(latlng, feature) {
-
-    if (
-      !this._map ||
-      !feature?.geometry
-    )
-      return 0;
-
-    const p =
-      this._map.latLngToContainerPoint(
-        latlng
-      );
-
-    let best = Infinity;
-
-    const distanceToRing =
-      ring => {
-
-        for (
-          let i = 0;
-          i < ring.length - 1;
-          i++
-        ) {
-
-          const a =
-            this._map.latLngToContainerPoint(
-              [
-                ring[i][1],
-                ring[i][0]
-              ]
-            );
-
-          const b =
-            this._map.latLngToContainerPoint(
-              [
-                ring[i + 1][1],
-                ring[i + 1][0]
-              ]
-            );
-
-          const dx = b.x - a.x;
-          const dy = b.y - a.y;
-
-          const len2 =
-            dx * dx +
-            dy * dy;
-
-          let t =
-            len2
-              ? (
-                  (
-                    (p.x - a.x) * dx +
-                    (p.y - a.y) * dy
-                  ) /
-                  len2
-                )
-              : 0;
-
-          t =
-            Math.max(
-              0,
-              Math.min(
-                1,
-                t
-              )
-            );
-
-          const x =
-            a.x +
-            t * dx;
-
-          const y =
-            a.y +
-            t * dy;
-
-          best =
-            Math.min(
-              best,
-              Math.hypot(
-                p.x - x,
-                p.y - y
-              )
-            );
-        }
-      };
-
-    const g =
-      feature.geometry;
-
-    if (
-      g.type ===
-      "Polygon"
-    ) {
-
-      g.coordinates.forEach(
-        distanceToRing
-      );
-    }
-
-    else if (
-      g.type ===
-      "MultiPolygon"
-    ) {
-
-      g.coordinates.forEach(
-        polygon =>
-          polygon.forEach(
-            distanceToRing
-          )
-      );
-    }
-
-    return Number.isFinite(best)
-      ? best
-      : 0;
-  }
 
 
   getLayerCenter(layer) {
 
-    if (
-      !this._map ||
-      !layer?.feature
-    ) {
-
-      try {
-
-        return layer
-          .getBounds()
-          .getCenter();
-
-      }
-      catch(e) {
-
-        return null;
-      }
-    }
-
-
-    const bounds =
-      layer.getBounds();
-
-    let best = null;
-    let bestScore = -1;
-
-    /*
-     * Шукаємо не геометричний центр bounds,
-     * а точку, яка реально лежить усередині
-     * області та максимально віддалена від
-     * її контуру. Для підписів це значно
-     * стабільніше на вузьких областях.
-     */
-
-    const search =
-      (
-        center,
-        latSpan,
-        lonSpan,
-        steps
-      ) => {
-
-        for (
-          let y = 0;
-          y <= steps;
-          y++
-        ) {
-
-          for (
-            let x = 0;
-            x <= steps;
-            x++
-          ) {
-
-            const lat =
-              center.lat -
-              latSpan / 2 +
-              latSpan * y / steps;
-
-            const lng =
-              center.lng -
-              lonSpan / 2 +
-              lonSpan * x / steps;
-
-            const candidate =
-              L.latLng(
-                lat,
-                lng
-              );
-
-            if (
-              !this.pointInFeature(
-                candidate,
-                layer.feature
-              )
-            )
-              continue;
-
-            const score =
-              this.distanceToFeatureEdges(
-                candidate,
-                layer.feature
-              );
-
-            if (
-              score >
-              bestScore
-            ) {
-
-              bestScore =
-                score;
-
-              best =
-                candidate;
-            }
-          }
-        }
-      };
-
-
-    const initialCenter =
-      bounds.getCenter();
-
-    let latSpan =
-      bounds.getNorth() -
-      bounds.getSouth();
-
-    let lonSpan =
-      bounds.getEast() -
-      bounds.getWest();
-
-
-    search(
-      initialCenter,
-      latSpan,
-      lonSpan,
-      10
-    );
-
-
-    for (
-      let pass = 0;
-      pass < 3 && best;
-      pass++
-    ) {
-
-      latSpan /= 4;
-      lonSpan /= 4;
-
-      search(
-        best,
-        latSpan,
-        lonSpan,
-        8
-      );
-    }
-
-
-    if (best)
-      return best;
-
+    if (layer?._neptunLabelCenter)
+      return layer._neptunLabelCenter;
 
     try {
-
-      if (
-        typeof layer.getCenter ===
-        "function"
-      )
-        return layer.getCenter();
+      /* Bounds center is O(1). The old iterative interior-point search ran
+       * thousands of point-in-polygon and edge-distance projections for
+       * every oblast and dominated startup (~6 seconds). */
+      const center = layer.getBounds().getCenter();
+      layer._neptunLabelCenter = center;
+      return center;
     }
-    catch(e) {}
-
-
-    return bounds.getCenter();
+    catch(e) {
+      return null;
+    }
   }
 
   getOblastLabelWidth(layer) {
@@ -3588,6 +3171,7 @@ class HANeptunMap extends HTMLElement {
 
     this._raionAlertLevels =
       raions;
+
   }
 
 
@@ -3645,364 +3229,44 @@ class HANeptunMap extends HTMLElement {
   }
 
 
-  applyRaionOblastClip() {
-
-    if (
-      !this._map ||
-      !this._raionLayer ||
-      !this._oblastLayer
-    )
-      return;
-
-
-    const pane =
-      this._map.getPane(
-        "raions"
-      );
-
-
-    const svg =
-      pane?.querySelector(
-        "svg"
-      );
-
-
-    if (!svg)
-      return;
-
+  buildPolygonOutlines(
+    geojson
+  ) {
 
     /*
-     * Build district -> oblast ownership only once.
-     *
-     * The old implementation repeated getBounds(), pointInFeature()
-     * and Array.find() for every district after every move/zoom.
-     * That was particularly expensive in Safari/WKWebView.
-     */
-    if (!this._raionClipAssignments) {
-
-      const oblasts = [];
-
-
-      this._oblastLayer.eachLayer(
-        layer => {
-
-          if (
-            !layer.feature ||
-            !layer._path
-          )
-            return;
-
-
-          const name =
-            this.normalizeName(
-              this.getOblastName(
-                layer.feature
-              )
-            );
-
-
-          if (!name)
-            return;
-
-
-          oblasts.push({
-            feature:layer.feature,
-            layer,
-            id:
-              "neptun-oblast-clip-" +
-              name.replace(
-                /[^a-zа-яіїєґ0-9]+/gi,
-                "-"
-              )
-          });
-        }
-      );
-
-
-      const assignments = [];
-
-
-      this._raionLayer.eachLayer(
-        district => {
-
-          if (
-            !district.feature ||
-            !district._path
-          )
-            return;
-
-
-          const center =
-            district.getBounds()
-              .getCenter();
-
-
-          const oblast =
-            oblasts.find(
-              item =>
-                this.pointInFeature(
-                  center.lat,
-                  center.lng,
-                  item.feature
-                )
-            );
-
-
-          if (oblast)
-            assignments.push({
-              district,
-              oblast
-            });
-        }
-      );
-
-
-      this._raionClipAssignments =
-        assignments;
-    }
-
-
-    /*
-     * Keep one persistent <defs>. Recreating all clipPath nodes on
-     * every moveend/zoomend caused avoidable SVG DOM churn.
-     */
-    let defs =
-      this._raionClipDefs;
-
-
-    if (
-      !defs ||
-      defs.ownerSVGElement !== svg
-    ) {
-
-      defs =
-        svg.querySelector(
-          "defs[data-neptun-clips]"
-        );
-
-
-      if (!defs) {
-
-        defs =
-          document.createElementNS(
-            "http://www.w3.org/2000/svg",
-            "defs"
-          );
-
-        defs.setAttribute(
-          "data-neptun-clips",
-          "1"
-        );
-
-        svg.insertBefore(
-          defs,
-          svg.firstChild
-        );
-      }
-
-
-      this._raionClipDefs = defs;
-      this._raionClipPaths.clear();
-    }
-
-
-    /*
-     * Leaflet changes the oblast SVG path's "d" on zoom. Copy only
-     * that geometry into our persistent clip paths. No node removal,
-     * clone storm or district ownership calculation is needed.
-     */
-    for (
-      const item
-      of this._raionClipAssignments
-    ) {
-
-      const {
-        district,
-        oblast
-      } = item;
-
-
-      if (
-        !district._path ||
-        !oblast.layer._path
-      )
-        continue;
-
-
-      let clipPath =
-        this._raionClipPaths.get(
-          oblast.id
-        );
-
-
-      if (!clipPath) {
-
-        const clip =
-          document.createElementNS(
-            "http://www.w3.org/2000/svg",
-            "clipPath"
-          );
-
-        clip.id =
-          oblast.id;
-
-
-        clipPath =
-          document.createElementNS(
-            "http://www.w3.org/2000/svg",
-            "path"
-          );
-
-        clipPath.setAttribute(
-          "fill",
-          "#000"
-        );
-
-        clipPath.setAttribute(
-          "stroke",
-          "none"
-        );
-
-        clip.appendChild(
-          clipPath
-        );
-
-        defs.appendChild(
-          clip
-        );
-
-        this._raionClipPaths.set(
-          oblast.id,
-          clipPath
-        );
-      }
-
-
-      const d =
-        oblast.layer._path
-          .getAttribute(
-            "d"
-          );
-
-
-      if (
-        d &&
-        clipPath.getAttribute("d") !== d
-      )
-        clipPath.setAttribute(
-          "d",
-          d
-        );
-
-
-      const expected =
-        `url(#${oblast.id})`;
-
-
-      if (
-        district._path.getAttribute(
-          "clip-path"
-        ) !== expected
-      )
-        district._path.setAttribute(
-          "clip-path",
-          expected
-        );
-    }
-  }
-
-  buildInternalRaionBoundaries(geojson) {
-
-    /*
-     * Беремо тільки сегменти, які належать двом районним
-     * полігонам. Сегмент, що зустрівся один раз, є зовнішнім
-     * периметром і тут навмисно не малюється.
+     * Border-only geometry: keep the outer ring of each polygon
+     * instead of instantiating a second full nationwide polygon set.
+     * This preserves the visible oblast outline above district fills
+     * while avoiding duplicate fill paths and polygon bookkeeping.
      */
 
-    const segments =
-      new Map();
-
-
-    const addRing =
-      ring => {
-
-        for (
-          let i = 1;
-          i < ring.length;
-          i++
-        ) {
-
-          const a = ring[i - 1];
-          const b = ring[i];
-
-
-          const ka =
-            a[0].toFixed(6) +
-            "," +
-            a[1].toFixed(6);
-
-          const kb =
-            b[0].toFixed(6) +
-            "," +
-            b[1].toFixed(6);
-
-
-          const key =
-            ka < kb
-              ? ka + "|" + kb
-              : kb + "|" + ka;
-
-
-          const found =
-            segments.get(key);
-
-
-          if (found)
-            found.count++;
-
-          else
-            segments.set(
-              key,
-              {
-                count:1,
-                coords:[a,b]
-              }
-            );
-        }
-      };
+    const lines = [];
 
 
     const addPolygon =
       polygon => {
 
-        /*
-         * GeoJSON Polygon: coordinates[0] — зовнішній контур,
-         * coordinates[1..] — внутрішні отвори (водойми, острови
-         * та інші вирізи). Для районної адміністративної сітки
-         * вони не є межами районів і мають бути проігноровані.
-         */
-
-        const outerRing =
+        const outer =
           polygon?.[0];
 
 
         if (
-          outerRing &&
-          outerRing.length > 1
+          outer &&
+          outer.length > 1
         )
-          addRing(
-            outerRing
+          lines.push(
+            outer
           );
       };
 
 
     for (
       const feature
-      of geojson.features || []
+      of (geojson?.features || [])
     ) {
 
       const geometry =
-        feature.geometry;
+        feature?.geometry;
 
 
       if (!geometry)
@@ -4027,7 +3291,9 @@ class HANeptunMap extends HTMLElement {
           const polygon
           of geometry.coordinates
         )
-          addPolygon(polygon);
+          addPolygon(
+            polygon
+          );
       }
     }
 
@@ -4039,19 +3305,305 @@ class HANeptunMap extends HTMLElement {
 
       geometry:{
         type:"MultiLineString",
-
-        coordinates:
-          [...segments.values()]
-            .filter(
-              item =>
-                item.count > 1
-            )
-            .map(
-              item =>
-                item.coords
-            )
+        coordinates:lines
       }
     };
+  }
+
+
+  fillAdministrativePolygonHoles(
+    geojson
+  ) {
+
+    /*
+     * District source geometry contains interior rings for water
+     * bodies (notably the Dnipro reservoirs). For an alert map those
+     * are not administrative exclusions: the alert must visually
+     * cover the whole district, including water.
+     *
+     * Keep every Polygon/MultiPolygon outer ring exactly as supplied
+     * and drop only interior rings in the render copy. This preserves
+     * district topology and does not simplify any coordinates.
+     */
+
+    const fillGeometry =
+      geometry => {
+
+        if (!geometry)
+          return geometry;
+
+
+        if (
+          geometry.type ===
+          "Polygon"
+        ) {
+
+          return {
+            ...geometry,
+            coordinates:
+              geometry.coordinates?.length
+                ? [geometry.coordinates[0]]
+                : geometry.coordinates
+          };
+        }
+
+
+        if (
+          geometry.type ===
+          "MultiPolygon"
+        ) {
+
+          return {
+            ...geometry,
+            coordinates:
+              geometry.coordinates.map(
+                polygon =>
+                  polygon?.length
+                    ? [polygon[0]]
+                    : polygon
+              )
+          };
+        }
+
+
+        return geometry;
+      };
+
+
+    return {
+      ...geojson,
+
+      features:
+        (geojson?.features || [])
+          .map(
+            feature => ({
+              ...feature,
+              geometry:
+                fillGeometry(
+                  feature.geometry
+                )
+            })
+          )
+    };
+  }
+
+
+  simplifyRaionGeometry(geometry) {
+
+    /* Preserve administrative topology exactly. There are only ~190 district
+     * polygons; destructive coordinate quantization is not worth the visual
+     * gaps it can create. We strip holes only, while Leaflet smoothFactor
+     * performs non-destructive screen-space simplification for rendering. */
+    if (!geometry)
+      return null;
+
+    if (geometry.type === "Polygon") {
+      const outer=geometry.coordinates?.[0];
+      return outer ? {type:"Polygon",coordinates:[outer]} : null;
+    }
+
+    if (geometry.type === "MultiPolygon") {
+      return {
+        type:"MultiPolygon",
+        coordinates:(geometry.coordinates || [])
+          .map(polygon => polygon?.[0] ? [polygon[0]] : [])
+          .filter(polygon => polygon.length)
+      };
+    }
+
+    return null;
+  }
+
+  buildInternalRaionBoundaries(geojson) {
+
+    /* Draw district rings themselves. Oblast borders live in a higher pane
+     * and cover perimeter duplicates. This is intentionally simple: the
+     * previous singleton classifier performed ~94k × 25 point-in-polygon
+     * tests and froze Firefox for seconds. */
+    const coordinates=[];
+
+    const addPolygon = polygon => {
+      const outer=polygon?.[0];
+      if (outer?.length>1)
+        coordinates.push(outer);
+    };
+
+    for (const feature of geojson.features || []) {
+      const geometry=feature?.geometry;
+      if (!geometry) continue;
+      if (geometry.type==="Polygon")
+        addPolygon(geometry.coordinates);
+      else if (geometry.type==="MultiPolygon")
+        for (const polygon of geometry.coordinates)
+          addPolygon(polygon);
+    }
+
+    return {
+      type:"Feature",
+      properties:{},
+      geometry:{type:"MultiLineString",coordinates}
+    };
+  }
+
+  geoDataSlug(name) {
+
+    const map = {
+      "а":"a","б":"b","в":"v","г":"h","ґ":"g","д":"d",
+      "е":"e","є":"ye","ж":"zh","з":"z","и":"y","і":"i",
+      "ї":"yi","й":"y","к":"k","л":"l","м":"m","н":"n",
+      "о":"o","п":"p","р":"r","с":"s","т":"t","у":"u",
+      "ф":"f","х":"kh","ц":"ts","ч":"ch","ш":"sh","щ":"shch",
+      "ь":"","ю":"yu","я":"ya"
+    };
+
+
+    return String(name || "")
+      .toLowerCase()
+      .replace(/[’ʼ']/g,"")
+      .split("")
+      .map(char => map[char] ?? (/^[a-z0-9]$/.test(char) ? char : "_"))
+      .join("")
+      .replace(/_+/g,"_")
+      .replace(/^_|_$/g,"");
+  }
+
+
+  async readGeoCache() {
+
+    if (!("indexedDB" in window))
+      return null;
+
+
+    return new Promise(
+      resolve => {
+
+        let request;
+
+        try {
+          request = indexedDB.open(
+            "ha-neptun-map",
+            1
+          );
+        }
+        catch(e) {
+          resolve(null);
+          return;
+        }
+
+
+        request.onupgradeneeded =
+          () => {
+
+            const db = request.result;
+
+            if (!db.objectStoreNames.contains("geo"))
+              db.createObjectStore("geo");
+          };
+
+
+        request.onerror =
+          () => resolve(null);
+
+
+        request.onsuccess =
+          () => {
+
+            const db = request.result;
+            const tx = db.transaction("geo","readonly");
+            const get = tx.objectStore("geo").get("v9");
+
+            get.onsuccess =
+              () => {
+                resolve(get.result || null);
+                db.close();
+              };
+
+            get.onerror =
+              () => {
+                resolve(null);
+                db.close();
+              };
+          };
+      }
+    );
+  }
+
+
+  async writeGeoCache(value) {
+
+    if (!("indexedDB" in window))
+      return;
+
+
+    return new Promise(
+      resolve => {
+
+        let request;
+
+        try {
+          request = indexedDB.open(
+            "ha-neptun-map",
+            1
+          );
+        }
+        catch(e) {
+          resolve();
+          return;
+        }
+
+
+        request.onupgradeneeded =
+          () => {
+
+            const db = request.result;
+
+            if (!db.objectStoreNames.contains("geo"))
+              db.createObjectStore("geo");
+          };
+
+
+        request.onerror =
+          () => resolve();
+
+
+        request.onsuccess =
+          () => {
+
+            const db = request.result;
+            const tx = db.transaction("geo","readwrite");
+
+            tx.oncomplete =
+              () => {
+                db.close();
+                resolve();
+              };
+
+            tx.onerror =
+              () => {
+                db.close();
+                resolve();
+              };
+
+            tx.objectStore("geo").put(value,"v9");
+          };
+      }
+    );
+  }
+
+
+  deleteLegacyGeoCaches() {
+    if (!("indexedDB" in window)) return;
+    try {
+      const request=indexedDB.open("ha-neptun-map",1);
+      request.onsuccess=() => {
+        const db=request.result;
+        const tx=db.transaction("geo","readwrite");
+        const store=tx.objectStore("geo");
+        for (const key of ["v2","v3","v4","v5","v6","v7","v8"]) store.delete(key);
+        tx.oncomplete=() => db.close();
+        tx.onerror=() => db.close();
+      };
+    } catch(e) {}
   }
 
 
@@ -4059,227 +3611,205 @@ class HANeptunMap extends HTMLElement {
 
     if (
       this._raionsLoaded ||
-      !this._map
+      !this._map ||
+      !this._oblastGeoJSON
     )
       return;
 
-
     this._raionsLoaded = true;
 
-
-    /*
-     * Один легкий nationwide GeoJSON замість 25 важких
-     * обласних файлів. Цю саму геометрію використовуємо і
-     * для alert-fill, і для районних меж.
-     *
-     * Зовнішню похибку спрощеної геометрії вже прибирає
-     * applyRaionOblastClip(), а еталонний контур областей
-     * лишається окремим верхнім шаром.
-     */
-
-    const URL =
-      "https://raw.githubusercontent.com/slawomirmatuszak/ukrainian_geodata/master/rayony.geojson";
-
-
-    const cacheKey =
-      "neptun_raions_fast_v1";
-
-
-    let geojson = null;
-
-
     try {
+      let bundle = await this.readGeoCache();
 
-      const cached =
-        localStorage.getItem(
-          cacheKey
+      /*
+       * v9 stores topology-preserving district polygons and labels. The expensive
+       * source GeoJSON never enters the hot startup path again after the
+       * first cold build.
+       */
+      if (!bundle?.simplifiedRaions) {
+        const names = (this._oblastGeoJSON.features || [])
+          .map(feature => this.getOblastName(feature))
+          .filter(Boolean);
+
+        const results = await Promise.allSettled(
+          names.map(async name => {
+            const slug = this.geoDataSlug(name);
+            const response = await fetch(
+              "https://cdn.jsdelivr.net/gh/darmat1/ukraine-geo-data@main/geodata/" +
+              slug + ".geojson"
+            );
+            if (!response.ok)
+              throw new Error(name + " HTTP " + response.status);
+            return response.json();
+          })
         );
 
+        const features = [];
+        for (const result of results)
+          if (result.status === "fulfilled")
+            features.push(...(result.value?.features || []));
 
-      if (cached)
-        geojson =
-          JSON.parse(cached);
+        if (!features.length)
+          throw new Error("No district geometry loaded");
 
-    }
-    catch(e) {}
+        const sourceRaions = this.fillAdministrativePolygonHoles({
+          type:"FeatureCollection",
+          features
+        });
 
+        const simplifiedFeatures = [];
+        for (const feature of sourceRaions.features || []) {
+          const geometry = this.simplifyRaionGeometry(feature.geometry);
+          if (!geometry)
+            continue;
 
-    try {
-
-      if (!geojson) {
-
-        const response =
-          await fetch(
-            URL
-          );
-
-
-        if (!response.ok)
-          throw new Error(
-            "Raion GeoJSON HTTP " +
-            response.status
-          );
-
-
-        geojson =
-          await response.json();
-
-
-        try {
-
-          localStorage.setItem(
-            cacheKey,
-            JSON.stringify(
-              geojson
-            )
-          );
-
+          /* Keep only properties needed by runtime name matching. */
+          simplifiedFeatures.push({
+            type:"Feature",
+            properties:{rayon:this.getRaionName(feature)},
+            geometry
+          });
         }
-        catch(e) {}
+
+        const simplifiedRaions = {type:"FeatureCollection",features:simplifiedFeatures};
+        const centers = await this.fetchRaionCenters();
+
+        bundle = {
+          version:9,
+          simplifiedRaions,
+          centers
+        };
+
+        await this.writeGeoCache(bundle);
+        this.deleteLegacyGeoCaches();
       }
 
+      const simplifiedRaions = bundle.simplifiedRaions;
 
-      this._raionLayer =
-        L.geoJSON(
-          geojson,
-          {
-            pane:"raions",
+      /* Derived boundary geometry is deliberately NOT stored in IndexedDB.
+       * Rebuild from the same simplified polygons on both cold and warm paths.
+       * This prevents cache serialization from changing/losing the line payload
+       * and keeps one authoritative geometry source. */
+      const boundaries=this.buildInternalRaionBoundaries(simplifiedRaions);
 
-            interactive:false,
-
-            style:
-              feature =>
-                this.raionStyle(
-                  feature
-                )
-          }
-        )
-        .addTo(
-          this._map
-        );
-
+      this._raionLayersByName.clear();
 
       /*
-       * Межі використовують той самий уже завантажений
-       * GeoJSON — другого HTTP-запиту та другого JSON.parse
-       * більше немає.
+       * Do NOT instantiate 130 Leaflet polygons and remove 120 of them.
+       * Index lightweight GeoJSON by district name, then instantiate only
+       * districts that currently have an alert.
        */
+      const featuresByName = new Map();
+      for (const feature of simplifiedRaions.features || []) {
+        const name = this.normalizeRaionName(this.getRaionName(feature));
+        if (!name) continue;
+        const list = featuresByName.get(name) || [];
+        list.push(feature);
+        featuresByName.set(name,list);
+      }
 
-      /*
-       * Do NOT instantiate the nationwide district polygons twice.
-       *
-       * The fill layer above already owns all district polygons.
-       * For visible district borders we only need shared internal
-       * line segments, so build one lightweight MultiLineString.
-       * This removes the second full set of Leaflet polygon paths
-       * from the DOM and cuts projection work during zoom.
-       */
-      this._raionBoundaryGeoJSON =
-        this.buildInternalRaionBoundaries(
-          geojson
-        );
+      this._raionLayer = L.layerGroup().addTo(this._map);
 
-
-      this._raionBoundaryLayer =
-        L.geoJSON(
-          this._raionBoundaryGeoJSON,
-          {
-            pane:"raions",
+      for (const [name,level] of this._raionAlertLevels) {
+        void level;
+        const features = featuresByName.get(name) || [];
+        const layers = [];
+        for (const feature of features) {
+          const layer = L.geoJSON(feature,{
+            pane:"raionFills",
             interactive:false,
+            smoothFactor:2.2,
+            style:item => this.raionStyle(item)
+          });
+          layer.feature = feature;
+          layer.addTo(this._raionLayer);
+          layers.push(layer);
+        }
+        if (layers.length)
+          this._raionLayersByName.set(name,layers);
+      }
 
-            style:() => ({
-              weight:0,
-              opacity:0,
-              fill:false,
-              fillOpacity:0
-            })
-          }
-        )
-        .addTo(
-          this._map
-        );
+      /* Retain the compact feature index for alerts that appear later. */
+      this._raionFeaturesByName = featuresByName;
 
+      this._raionBoundaryLayer = L.geoJSON(boundaries,{
+        pane:"raionBorders",
+        interactive:false,
+        smoothFactor:1.5,
+        style:() => ({
+          color:this.isLightTheme()
+            ? "rgba(52,66,76,.72)"
+            : "rgba(218,229,235,.68)",
+          weight:1.05,
+          opacity:0,
+          fill:false,
+          lineJoin:"round",
+          lineCap:"round"
+        })
+      }).addTo(this._map);
 
-      this.loadRaionCenters();
+      /* Adjacent source polygons can differ by sub-pixel geometry. Keep their
+       * strokes visually collapsed and stable while zooming. */
+      this._raionBoundaryLayer.eachLayer(layer => {
+        const path=layer?._path;
+        if (path) {
+          path.setAttribute("vector-effect","non-scaling-stroke");
+          path.setAttribute("shape-rendering","geometricPrecision");
+        }
+      });
+
+      this.createRaionCenterMarkers(bundle.centers || []);
+      this._appliedRaionAlertLevels = new Map(this._raionAlertLevels);
+
+      /* A realtime snapshot can call updateRaionDisplay() before cached
+       * district layers finish attaching. In that case the display key is
+       * already current while the boundary layer was still absent, so the
+       * new layer would remain at its initial opacity:0 forever. Force one
+       * application now that the layer actually exists. */
+      this._lastRaionDisplayKey = null;
       this.updateRaionDisplay();
-
-      requestAnimationFrame(
-        () =>
-          this.applyRaionOblastClip()
-      );
-
+      this.updateKyivBoundary();
+      if (this._startupMark) this._startupMark("districts ready");
     }
-
     catch(e) {
-
-      console.warn(
-        "NEPTUN CARD: raions:",
-        e
-      );
-
-
+      console.warn("NEPTUN CARD: raions:",e);
       this._raionsLoaded = false;
     }
   }
 
 
-  async loadRaionCenters() {
-
-    if (!this._map)
-      return;
-
+  async fetchRaionCenters() {
 
     try {
 
-      const URL =
-        "https://gis.unocha.org/server/rest/services/Hosted/cod_ab_ukr_v05/FeatureServer/0/query?where=adm_p_lvl%3D2&outFields=*&returnGeometry=true&outSR=4326&f=geojson";
-
-
       const response =
-        await fetch(URL);
-
+        await fetch(
+          "https://gis.unocha.org/server/rest/services/Hosted/cod_ab_ukr_v05/FeatureServer/0/query?where=adm_p_lvl%3D2&outFields=*&returnGeometry=true&outSR=4326&f=geojson"
+        );
 
       if (!response.ok)
         throw new Error(
-          "Raion centers HTTP " +
-          response.status
+          "Raion centers HTTP " + response.status
         );
 
 
-      const data =
-        await response.json();
+      const data = await response.json();
+      const centers = [];
 
 
-      for (
-        const feature
-        of (
-          data?.features || []
-        )
-      ) {
+      for (const feature of (data?.features || [])) {
 
         const coordinates =
           feature?.geometry?.coordinates;
 
-
         if (
           !coordinates ||
-          feature?.geometry?.type !==
-          "Point"
+          feature?.geometry?.type !== "Point"
         )
           continue;
 
 
-        const p =
-          feature.properties || {};
-
-
-        /*
-         * У різних версіях COD поля називаються по-різному.
-         * p.name часто англомовний, тому не беремо його першим.
-         * Спочатку шукаємо явні українські поля, а потім —
-         * будь-яке текстове поле з кирилицею.
-         */
-
+        const p = feature.properties || {};
         const ukrainianCandidates = [
           p.name_ua,
           p.name_uk,
@@ -4302,8 +3832,7 @@ class HANeptunMap extends HTMLElement {
           ) || "";
 
 
-        if (!name) {
-
+        if (!name)
           name =
             Object.values(p).find(
               value =>
@@ -4311,95 +3840,129 @@ class HANeptunMap extends HTMLElement {
                 /[А-Яа-яІіЇїЄєҐґ]/.test(value) &&
                 !/область$/i.test(value)
             ) || "";
-        }
 
 
-        /*
-         * Англійський fallback лишаємо тільки якщо джерело
-         * взагалі не віддало української назви.
-         */
-
-        if (!name) {
-
+        if (!name)
           name =
             p.name ||
             p.admin2Name ||
             p.ADM2_EN ||
             "";
-        }
 
 
-        if (!name)
-          continue;
-
-
-        const marker =
-          L.marker(
-            [
-              coordinates[1],
-              coordinates[0]
-            ],
-            {
-              pane:"raionLabels",
-              interactive:false,
-              keyboard:false,
-
-              icon:
-                L.divIcon({
-                  className:
-                    "raion-center-wrapper",
-
-                  html:`
-                    <div class="raion-center-label">
-                      <span class="raion-center-dot"></span>
-                      <span class="raion-center-name">
-                        ${this.escape(name)}
-                      </span>
-                    </div>
-                  `,
-
-                  iconSize:[4,18],
-                  iconAnchor:[2,9]
-                })
-            }
-          )
-          .addTo(
-            this._map
-          );
-
-
-        this._raionCenterLabels.push({
-          marker,
-          name
-        });
+        if (name)
+          centers.push({
+            name,
+            lat:coordinates[1],
+            lng:coordinates[0]
+          });
       }
 
 
-      this.updateRaionDisplay();
-
+      return centers;
     }
-
     catch(e) {
-
       console.warn(
         "NEPTUN CARD: raion centers:",
         e
       );
+      return [];
+    }
+  }
+
+
+  createRaionCenterMarkers(centers) {
+
+    if (!this._map)
+      return;
+
+
+    this._raionCenterLabels = [];
+
+
+    for (const center of centers) {
+
+      const marker =
+        L.marker(
+          [center.lat,center.lng],
+          {
+            pane:"raionLabels",
+            interactive:false,
+            keyboard:false,
+            icon:L.divIcon({
+              className:"raion-center-wrapper",
+              html:`<div class="raion-center-label"><span class="raion-center-dot"></span><span class="raion-center-name">${this.escape(center.name)}</span></div>`,
+              iconSize:[4,18],
+              iconAnchor:[2,9]
+            })
+          }
+        );
+
+
+      this._raionCenterLabels.push({
+        marker,
+        name:center.name,
+        visible:false
+      });
     }
   }
 
 
   refreshRaions() {
 
-    /*
-     * updateRaionDisplay() already applies the complete fill and
-     * boundary style. A separate full setStyle() pass here used to
-     * style every district twice for each realtime snapshot.
-     */
+    if (!this._raionLayer)
+      return;
 
-    this.updateRaionDisplay();
+
+    const names = new Set([
+      ...this._appliedRaionAlertLevels.keys(),
+      ...this._raionAlertLevels.keys()
+    ]);
+
+
+    for (const name of names) {
+      const previous = this._appliedRaionAlertLevels.get(name) || null;
+      const current = this._raionAlertLevels.get(name) || null;
+
+      if (previous === current)
+        continue;
+
+      let layers = this._raionLayersByName.get(name) || [];
+
+      if (current && !layers.length) {
+        const features = this._raionFeaturesByName.get(name) || [];
+        layers = features.map(feature => {
+          const layer = L.geoJSON(feature,{
+            pane:"raionFills",
+            interactive:false,
+            smoothFactor:2.2,
+            style:item => this.raionStyle(item)
+          });
+          layer.feature = feature;
+          layer.addTo(this._raionLayer);
+          return layer;
+        });
+        if (layers.length)
+          this._raionLayersByName.set(name,layers);
+      }
+
+      for (const layer of layers) {
+        if (current)
+          layer.setStyle(this.raionStyle(layer.feature));
+        else {
+          this._raionLayer.removeLayer(layer);
+          layer.remove();
+        }
+      }
+
+      if (!current)
+        this._raionLayersByName.delete(name);
+    }
+
+
+    this._appliedRaionAlertLevels =
+      new Map(this._raionAlertLevels);
   }
-
 
   updateRaionDisplay() {
 
@@ -4417,70 +3980,57 @@ class HANeptunMap extends HTMLElement {
 
 
     const showCenters =
-      delta >= 2.0;
+      delta >= 2.75;
 
 
-    if (this._raionLayer) {
-
-      const light =
-        this.isLightTheme();
-
-
-      this._raionLayer.eachLayer(
-        layer => {
-
-          const level =
-            this.getRaionAlertLevel(
-              layer.feature
-            );
-
-
-          const base =
-            this.raionStyle(
-              layer.feature
-            );
-
-
-          layer.setStyle({
-            ...base,
-            weight:0,
-            opacity:0
-          });
-        }
-      );
-    }
+    const displayKey = [
+      delta < 1.55
+        ? "base"
+        : (
+            delta < 2.75
+              ? "boundary"
+              : (
+                  delta < 3.5
+                    ? "centers-small"
+                    : (
+                        delta < 4.5
+                          ? "centers-medium"
+                          : "centers-large"
+                      )
+                )
+          ),
+      this.isLightTheme()
+        ? "light"
+        : "dark"
+    ].join("|");
 
 
+    if (
+      displayKey ===
+      this._lastRaionDisplayKey
+    )
+      return;
+
+
+    /* Simplified district borders stay as one lightweight vector layer.
+     * Alert fills are separate on-demand vector polygons. */
     if (this._raionBoundaryLayer) {
-
-      /*
-       * Boundary geometry is now a single internal-line layer,
-       * not a second copy of every district polygon. Style it once.
-       */
       this._raionBoundaryLayer.setStyle({
-        color:
-          this.isLightTheme()
-            ? "rgba(74,88,98,.42)"
-            : "rgba(176,191,199,.34)",
-
-        weight:
-          showBoundary
-            ? (
-                delta >= 3.5
-                  ? .72
-                  : .62
-              )
-            : 0,
-
-        opacity:
-          showBoundary
-            ? .9
-            : 0,
-
+        color:this.isLightTheme()
+          ? "rgba(52,66,76,.72)"
+          : "rgba(218,229,235,.68)",
+        weight:delta >= 3.5 ? 0.82 : 0.68,
+        opacity:showBoundary ? 1 : 0,
         fill:false,
-        fillOpacity:0
+        lineJoin:"round",
+        lineCap:"round"
       });
+      this._lastRaionDisplayKey = displayKey;
     }
+
+
+    /* District fills are persistent simplified vectors. Realtime snapshots
+     * only restyle districts whose alert level actually changed. */
 
 
     for (
@@ -4488,21 +4038,44 @@ class HANeptunMap extends HTMLElement {
       of this._raionCenterLabels
     ) {
 
+      /*
+       * Do not keep every district label in the DOM while the
+       * nationwide view is visible. On WebKit hundreds of divIcon
+       * nodes are expensive even with display:none.
+       */
+      if (!showCenters) {
+
+        if (
+          item.visible &&
+          this._map.hasLayer(
+            item.marker
+          )
+        )
+          this._map.removeLayer(
+            item.marker
+          );
+
+
+        item.visible = false;
+        continue;
+      }
+
+
+      if (!item.visible) {
+
+        item.marker.addTo(
+          this._map
+        );
+
+        item.visible = true;
+      }
+
+
       const el =
         item.marker.getElement();
 
 
       if (!el)
-        continue;
-
-
-      el.style.display =
-        showCenters
-          ? ""
-          : "none";
-
-
-      if (!showCenters)
         continue;
 
 
@@ -4516,20 +4089,14 @@ class HANeptunMap extends HTMLElement {
         continue;
 
 
-      /*
-       * Районні центри з'являються лише після zoom +2.
-       * Далі плавно збільшуємо підпис разом із наближенням,
-       * щоб на великому zoom він не залишався мікроскопічним.
-       */
-
       const raionFont =
-        delta < 2.5
+        delta < 3.5
           ? 8.2
           : (
-              delta < 3.5
+              delta < 4.5
                 ? 9.2
                 : (
-                    delta < 4.5
+                    delta < 5.5
                       ? 10.2
                       : 11.2
                   )
@@ -4766,6 +4333,14 @@ class HANeptunMap extends HTMLElement {
     )
       return;
 
+    /* Keep Kyiv visually synchronized with district alerts. The Kyiv
+     * geometry may load earlier, but it must not flash an alert on an
+     * otherwise empty map while district layers are still attaching. */
+    if (!this._raionLayer) {
+      this._kyivBoundary.setStyle({opacity:0,fill:false,fillOpacity:0});
+      return;
+    }
+
     const delta =
       this._map.getZoom() -
       this._minimumZoom;
@@ -4907,13 +4482,42 @@ class HANeptunMap extends HTMLElement {
   }
 
 
+  scheduleLabelCollision(
+    delta
+  ) {
+
+    if (this._labelCollisionRaf)
+      cancelAnimationFrame(
+        this._labelCollisionRaf
+      );
+
+
+    this._labelCollisionRaf =
+      requestAnimationFrame(
+        () => {
+
+          this._labelCollisionRaf = null;
+
+
+          if (
+            !this._map ||
+            this._mapInteracting
+          )
+            return;
+
+
+          this.resolveLabelCollisions(
+            delta
+          );
+        }
+      );
+  }
+
+
   updateMapLabels() {
 
     if (!this._map)
       return;
-
-
-    this.applyMapLabelTheme();
 
 
     /*
@@ -4943,6 +4547,66 @@ class HANeptunMap extends HTMLElement {
         0,
         zoom - min
       );
+
+
+    const labelBucket =
+      delta < .75
+        ? 0
+        : (
+            delta < 1.0
+              ? 1
+              : (
+                  delta < 1.5
+                    ? 2
+                    : (
+                        delta < 2.5
+                          ? 3
+                          : (
+                              delta < 3.5
+                                ? 4
+                                : (
+                                    delta < 4.5
+                                      ? 5
+                                      : 6
+                                  )
+                            )
+                      )
+                )
+          );
+
+
+    const labelDisplayKey =
+      [
+        labelBucket,
+        lightTheme
+          ? "light"
+          : "dark"
+      ].join("|");
+
+
+    if (
+      labelDisplayKey ===
+      this._lastLabelDisplayKey
+    ) {
+
+      /*
+       * A pure pan does not require rewriting label styles, but
+       * collision geometry changes in viewport coordinates.
+       * Re-run only the lightweight visibility pass.
+       */
+      this.scheduleLabelCollision(
+        delta
+      );
+
+      return;
+    }
+
+
+    this._lastLabelDisplayKey =
+      labelDisplayKey;
+
+
+    this.applyMapLabelTheme();
 
 
     /*
@@ -5381,13 +5045,8 @@ class HANeptunMap extends HTMLElement {
      * перемірятися перед collision detection.
      */
 
-    requestAnimationFrame(
-      () => {
-
-        this.resolveLabelCollisions(
-          delta
-        );
-      }
+    this.scheduleLabelCollision(
+      delta
     );
   }
 
@@ -5709,7 +5368,6 @@ class HANeptunMap extends HTMLElement {
 
           this.renderThreats();
 
-          this.refreshOblasts();
           this.refreshRaions();
           this.updateKyivBoundary();
 
@@ -8834,6 +8492,37 @@ class HANeptunMap extends HTMLElement {
 
 
     /*
+     * Pending post-interaction/heavy-layer work.
+     */
+
+    if (this._interactionFinishRaf) {
+
+      cancelAnimationFrame(
+        this._interactionFinishRaf
+      );
+
+      this._interactionFinishRaf = null;
+    }
+
+
+    if (this._labelCollisionRaf) {
+
+      cancelAnimationFrame(
+        this._labelCollisionRaf
+      );
+
+      this._labelCollisionRaf = null;
+    }
+
+
+    this._interactionForceIcons = false;
+
+
+
+    this._heavyLayersScheduled = false;
+
+
+    /*
      * ResizeObserver.
      */
 
@@ -8909,6 +8598,16 @@ class HANeptunMap extends HTMLElement {
     }
 
 
+    /* Native desktop wheel guard. */
+    if (this._mapWheelGuard) {
+      try {
+        this.shadowRoot?.querySelector("#map")?.removeEventListener("wheel",this._mapWheelGuard);
+      }
+      catch(e) {}
+      this._mapWheelGuard = null;
+    }
+
+
     /*
      * Leaflet map.
      */
@@ -8959,14 +8658,15 @@ class HANeptunMap extends HTMLElement {
      */
 
     this._raionsLoaded = false;
+    this._lastLabelDisplayKey = null;
+    this._lastRaionDisplayKey = null;
     this._raionLayer = null;
     this._raionBoundaryLayer = null;
-    this._raionBoundaryGeoJSON = null;
-    this._raionClipAssignments = null;
-    this._raionClipDefs = null;
-    this._raionClipPaths.clear();
+    this._raionLayersByName.clear();
+    this._raionFeaturesByName.clear();
     this._oblastLayer = null;
     this._oblastBorderLayer = null;
+    this._oblastBorderTheme = null;
     this._oblastGeoJSON = null;
     this._kyivBoundaryLoaded = false;
     this._kyivBoundary = null;
@@ -9032,6 +8732,6 @@ if (
    =========================================================== */
 
 console.info(
-  "%c HA NEPTUN MAP v0.0.1-beta.1 ",
+  "%c HA NEPTUN MAP v0.0.1-beta.2 ",
   "background:#263238;color:#fff;padding:3px 7px;border-radius:4px;font-weight:bold;"
 );
